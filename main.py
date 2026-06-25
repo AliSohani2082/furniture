@@ -294,32 +294,45 @@ class Cropper:
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        # NOTE: GroundingDINO's deformable attention builds its sampling
+        # grid internally in fp32 and feeds it straight into
+        # nn.functional.grid_sample. grid_sample does not support fp16
+        # inputs on this path, so loading the detector in float16 crashes
+        # deep inside the model ("expected scalar type Half but found
+        # Float") regardless of what dtype you cast pixel_values to before
+        # calling it -- the mismatch happens on a tensor built *inside* the
+        # layer, which the caller has no way to intercept. Running the
+        # detector in float32 sidesteps this entirely. GroundingDINO-tiny
+        # is small and detection isn't the pipeline's bottleneck (TripoSR
+        # reconstruction is), so the fp32 cost here is negligible.
         model_id = "IDEA-Research/grounding-dino-tiny"
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.detector = AutoModelForZeroShotObjectDetection.from_pretrained(
             model_id,
-            torch_dtype=torch.float16
-            if self.device == "cuda"
-            else torch.float32,
+            dtype=torch.float32,
         ).to(self.device).eval()
 
         model_root = MODEL_DIR / "sam2"
         model_root.mkdir(parents=True, exist_ok=True)
 
+        # Only the checkpoint comes from HF Hub. The config name is NOT a
+        # filesystem path: build_sam2() resolves `cfg` through Hydra's own
+        # internal search path (provider=main, path=pkg://sam2), which only
+        # sees configs bundled inside the installed `sam2` package. Passing
+        # the absolute HF download path for the yaml makes Hydra try to
+        # resolve that string as a config *name* under pkg://sam2, which is
+        # exactly the MissingConfigException you hit.
         checkpoint = hf_hub_download(
             repo_id="facebook/sam2.1-hiera-large",
             filename="sam2.1_hiera_large.pt",
             local_dir=str(model_root),
             local_dir_use_symlinks=False,
         )
-        cfg = hf_hub_download(
-            repo_id="facebook/sam2.1-hiera-large",
-            filename="sam2.1_hiera_l.yaml",
-            local_dir=str(model_root),
-            local_dir_use_symlinks=False,
-        )
+        cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
-        self.sam = SAM2ImagePredictor(build_sam2(cfg, checkpoint))
+        self.sam = SAM2ImagePredictor(
+            build_sam2(cfg, checkpoint, device=self.device)
+        )
 
     def _fit_square_rgba(
         self,
@@ -353,19 +366,28 @@ class Cropper:
 
         image = Image.open(input_path).convert("RGB")
         prompt_list = [f"a {x}" for x in (labels or FURNITURE_LABELS)]
-
         inputs = self.processor(
             images=image,
             text=[prompt_list],
             return_tensors="pt",
         ).to(self.device)
 
+        # Detector now always runs in float32, so this cast is a no-op
+        # safety net rather than a load-bearing fix -- kept in case the
+        # model dtype ever changes again. input_ids/attention_mask are
+        # left untouched since they must stay integer/long tensors.
+        model_dtype = next(self.detector.parameters()).dtype
+        inputs = {
+            k: v.to(model_dtype) if v.is_floating_point() else v
+            for k, v in inputs.items()
+        }
+
         with self.torch.no_grad():
             outputs = self.detector(**inputs)
 
         results = self.processor.post_process_grounded_object_detection(
             outputs,
-            inputs.input_ids,
+            inputs["input_ids"],
             threshold=0.35,
             text_threshold=0.25,
             target_sizes=[(image.height, image.width)],
@@ -452,7 +474,6 @@ class Cropper:
             "fallback": False,
         }
 
-
 # =========================
 # TripoSR Generator
 # =========================
@@ -472,6 +493,15 @@ class TripoGenerator:
 
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # --- DEBUG: confirm which image_tokenizer module is actually loaded ---
+        import tsr.models.tokenizers.image as img_mod
+        print("=== tsr image tokenizer module path ===")
+        print(img_mod.__file__)
+        print("=== file contents (first 3000 chars) ===")
+        print(open(img_mod.__file__).read()[:3000])
+        print("=== end debug ===")
+        # --- end debug ---
 
         self.model = TSR.from_pretrained(
             "stabilityai/TripoSR",
