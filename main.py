@@ -484,15 +484,6 @@ class TripoGenerator:
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # --- DEBUG: confirm which image_tokenizer module is actually loaded ---
-        import tsr.models.tokenizers.image as img_mod
-        print("=== tsr image tokenizer module path ===")
-        print(img_mod.__file__)
-        print("=== file contents (first 3000 chars) ===")
-        print(open(img_mod.__file__).read()[:3000])
-        print("=== end debug ===")
-        # --- end debug ---
-
         self.model = TSR.from_pretrained(
             "stabilityai/TripoSR",
             config_name="config.yaml",
@@ -525,8 +516,9 @@ class TripoGenerator:
         image = self._fill_background(image)
 
         scene_codes = self.model(image, device=self.device)
-        mesh = self.model.extract_mesh(scene_codes, resolution=mc_resolution)[0]
-
+        mesh = self.model.extract_mesh(
+            scene_codes, has_vertex_color=True, resolution=mc_resolution
+        )[0]
         from tsr.utils import to_gradio_3d_orientation
 
         mesh = to_gradio_3d_orientation(mesh)
@@ -655,15 +647,44 @@ def render_views(job_id: str, size: int = 1024) -> dict:
 
 
 # =========================
+# Artifact Fetching
+# =========================
+#
+# Volume.reload() is only valid inside a running Modal Function/container --
+# calling it (or read_file()) from the local entrypoint process is not a
+# supported pattern and raises ConflictError/RuntimeError. Instead, fetch
+# artifact bytes via a small remote function that runs inside a container,
+# where the Volume's consistency guarantees actually apply, then write the
+# returned bytes to disk locally.
+
+@app.function(
+    image=BASE_IMAGE,
+    volumes={"/vol": ARTIFACTS_VOLUME},
+    timeout=120,
+)
+def fetch_artifacts(job_id: str, rels: list[str]) -> dict[str, bytes]:
+    ARTIFACTS_VOLUME.reload()
+    out: dict[str, bytes] = {}
+    for rel in rels:
+        if not rel:
+            continue
+        path = ARTIFACTS_DIR / rel
+        out[rel] = path.read_bytes()
+    return out
+
+
+def _save_artifacts(job_id: str, rels: list[str], out_root: Path) -> None:
+    rels = [r for r in rels if r]
+    files = fetch_artifacts.remote(job_id, rels)
+    for rel, data in files.items():
+        local_path = out_root / Path(rel).name
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(data)
+
+
+# =========================
 # Pipeline Orchestration
 # =========================
-
-def _download_from_volume(rel_path: str, local_path: Path) -> None:
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(local_path, "wb") as f:
-        for chunk in ARTIFACTS_VOLUME.read_file(rel_path):
-            f.write(chunk)
-
 
 def run_pipeline(page_url: str, out_dir: str = "outputs", mc_resolution: int = 256) -> dict:
     job_id = uuid.uuid4().hex[:12]
@@ -675,6 +696,7 @@ def run_pipeline(page_url: str, out_dir: str = "outputs", mc_resolution: int = 2
 
     persist_input_image.remote(image_bytes, job_id, image_url)
     crop_info = Cropper().crop.remote(job_id, FURNITURE_LABELS)
+    print("CROP INFO:", crop_info)
     mesh_info = TripoGenerator().generate.remote(job_id, mc_resolution)
     view_info = render_views.remote(job_id)
 
@@ -687,17 +709,19 @@ def run_pipeline(page_url: str, out_dir: str = "outputs", mc_resolution: int = 2
         "views": view_info,
     }
 
-    for rel in [
-        crop_info["crop_rel"],
-        crop_info.get("mask_rel"),
-        mesh_info["glb_rel"],
-        mesh_info["obj_rel"],
-        view_info["front_rel"],
-        view_info["side_rel"],
-        view_info["top_rel"],
-    ]:
-        if rel:
-            _download_from_volume(rel, out_root / Path(rel).name)
+    _save_artifacts(
+        job_id,
+        [
+            crop_info["crop_rel"],
+            crop_info.get("mask_rel"),
+            mesh_info["glb_rel"],
+            mesh_info["obj_rel"],
+            view_info["front_rel"],
+            view_info["side_rel"],
+            view_info["top_rel"],
+        ],
+        out_root,
+    )
 
     (out_root / "manifest.json").write_text(
         json.dumps(manifest, indent=2),
@@ -733,9 +757,19 @@ def test_local_image(image_path: str, out_dir: str = "outputs", mc_resolution: i
     view_info = render_views.remote(job_id)
 
     manifest = {"job_id": job_id, "crop": crop_info, "mesh": mesh_info, "views": view_info}
-    for rel in [crop_info["crop_rel"], crop_info.get("mask_rel"), mesh_info["glb_rel"],
-                mesh_info["obj_rel"], view_info["front_rel"], view_info["side_rel"], view_info["top_rel"]]:
-        if rel:
-            _download_from_volume(rel, out_root / Path(rel).name)
+
+    _save_artifacts(
+        job_id,
+        [
+            crop_info["crop_rel"],
+            crop_info.get("mask_rel"),
+            mesh_info["glb_rel"],
+            mesh_info["obj_rel"],
+            view_info["front_rel"],
+            view_info["side_rel"],
+            view_info["top_rel"],
+        ],
+        out_root,
+    )
 
     print(json.dumps(manifest, indent=2))
