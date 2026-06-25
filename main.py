@@ -50,46 +50,21 @@ HEADERS = {
     )
 }
 
+# Shared base layer (CUDA, system deps, common pip packages)
 BASE_IMAGE = (
     modal.Image.from_registry(
         "nvidia/cuda:12.1.1-devel-ubuntu22.04", add_python="3.11"
     )
     .apt_install(
-        "git",
-        "build-essential",
-        "cmake",
-        "ninja-build",
-        "ffmpeg",
-        "libgl1",
-        "libglib2.0-0",
-        "libsm6",
-        "libxext6",
-        "libegl1",
+        "git", "build-essential", "cmake", "ninja-build", "ffmpeg",
+        "libgl1", "libglib2.0-0", "libsm6", "libxext6", "libegl1",
     )
     .pip_install(
-        "setuptools>=68",
-        "wheel",
-        "requests",
-        "beautifulsoup4",
-        "lxml",
-        "pillow",
-        "pillow-avif-plugin",
-        "numpy",
-        "trimesh",
-        "pyrender",
-        "pygltflib",
-        "opencv-python-headless",
-        "rembg",
-        "transformers>=4.53.2",
-        "accelerate",
-        "huggingface_hub",
-        "playwright",
-        "pybind11",
-        "scikit-build-core",
-        "einops",
-        "omegaconf",
-        "imageio",
-        "onnxruntime",
+        "setuptools>=68", "wheel", "requests", "beautifulsoup4", "lxml",
+        "pillow", "pillow-avif-plugin", "numpy", "trimesh", "pyrender",
+        "pygltflib", "opencv-python-headless", "rembg", "accelerate",
+        "huggingface_hub", "playwright", "pybind11", "scikit-build-core",
+        "einops", "omegaconf", "imageio", "onnxruntime",
     )
     .run_commands("playwright install --with-deps chromium")
     .pip_install(
@@ -101,10 +76,24 @@ BASE_IMAGE = (
         "CC": "/usr/bin/gcc",
         "CXX": "/usr/bin/g++",
     })
+)
+
+# Cropper image: GroundingDINO + SAM2 — wants a modern transformers
+CROPPER_IMAGE = (
+    BASE_IMAGE
+    .pip_install("transformers>=4.53.2")
     .run_commands(
         "python -m pip install --no-build-isolation "
         "git+https://github.com/facebookresearch/sam2.git"
     )
+)
+
+# TripoSR image: needs a transformers old enough to predate the ViTModel
+# attention refactor (q_proj/k_proj/v_proj/o_proj), or the released
+# stabilityai/TripoSR checkpoint won't load via load_state_dict().
+TRIPO_IMAGE = (
+    BASE_IMAGE
+    .pip_install("transformers==4.46.3")
     .run_commands(
         "python -m pip install --no-build-isolation "
         "git+https://github.com/tatsy/torchmcubes.git"
@@ -273,7 +262,7 @@ def persist_input_image(image_bytes: bytes, job_id: str, source_url: str) -> dic
 # =========================
 
 @app.cls(
-    image=BASE_IMAGE,
+    image=CROPPER_IMAGE,
     gpu="A10",
     volumes={"/vol": ARTIFACTS_VOLUME},
     timeout=900,
@@ -307,11 +296,12 @@ class Cropper:
         # reconstruction is), so the fp32 cost here is negligible.
         model_id = "IDEA-Research/grounding-dino-tiny"
         self.processor = AutoProcessor.from_pretrained(model_id)
+        
         self.detector = AutoModelForZeroShotObjectDetection.from_pretrained(
             model_id,
-            dtype=torch.float32,
+            torch_dtype=torch.float32,
         ).to(self.device).eval()
-
+        
         model_root = MODEL_DIR / "sam2"
         model_root.mkdir(parents=True, exist_ok=True)
 
@@ -479,7 +469,7 @@ class Cropper:
 # =========================
 
 @app.cls(
-    image=BASE_IMAGE,
+    image=TRIPO_IMAGE,
     gpu="A10",
     volumes={"/vol": ARTIFACTS_VOLUME},
     timeout=900,
