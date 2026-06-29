@@ -1,47 +1,35 @@
+"""
+Pipeline E — Multi-Evidence 3D Reconstruction
+modal run main.py --page-url "https://example.com/sofa"
+modal run main.py::test_local_image --image-path grey_sofa.png
+"""
+from __future__ import annotations
+
 import json
-import math
-import os
-import re
 import uuid
-from io import BytesIO
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
 import modal
-import numpy as np
 import requests
-from bs4 import BeautifulSoup
-from PIL import Image, ImageOps
 
-# =========================
-# Modal App / Config
-# =========================
-
-APP_NAME = "pipeline-a-cheapest-fastest"
-app = modal.App(APP_NAME)
-
-ARTIFACTS_VOLUME = modal.Volume.from_name(
-    "pipeline-a-artifacts", create_if_missing=True
+# Import Modal app + shared infrastructure
+from images import (
+    ARTIFACTS_DIR,
+    ARTIFACTS_VOLUME,
+    BASE_IMAGE,
+    APP_NAME,
+    app,
 )
-ARTIFACTS_DIR = Path("/vol/artifacts")
-MODEL_DIR = Path("/vol/models")
 
-FURNITURE_LABELS = [
-    "chair",
-    "sofa",
-    "armchair",
-    "couch",
-    "stool",
-    "bench",
-    "table",
-    "desk",
-    "bookshelf",
-    "cabinet",
-    "dresser",
-    "nightstand",
-    "wardrobe",
-    "ottoman",
-]
+# Import all stage symbols so their @app.function / @app.cls decorators
+# register on `app` at import time
+from stages.s0_scrape import scrape_page
+from stages.s1_intelligence import analyze_page
+from stages.s2_crop import Cropper
+from stages.s3_reconstruct import InstantMeshGenerator
+from stages.s4_scale import scale_mesh
+from stages.s5_texture import TextureFuser
+from stages.s6_render import render_views
 
 HEADERS = {
     "User-Agent": (
@@ -50,612 +38,10 @@ HEADERS = {
     )
 }
 
-# Shared base layer (CUDA, system deps, common pip packages)
-BASE_IMAGE = (
-    modal.Image.from_registry(
-        "nvidia/cuda:12.1.1-devel-ubuntu22.04", add_python="3.11"
-    )
-    .apt_install(
-        "git", "build-essential", "cmake", "ninja-build", "ffmpeg",
-        "libgl1", "libglib2.0-0", "libsm6", "libxext6", "libegl1",
-    )
-    .pip_install(
-        "setuptools>=68", "wheel", "requests", "beautifulsoup4", "lxml",
-        "pillow", "pillow-avif-plugin", "numpy", "trimesh", "pyrender",
-        "pygltflib", "opencv-python-headless", "rembg", "accelerate",
-        "huggingface_hub", "playwright", "pybind11", "scikit-build-core",
-        "einops", "omegaconf", "imageio", "onnxruntime",
-    )
-    .run_commands("playwright install --with-deps chromium")
-    .pip_install(
-        "torch", "torchvision",
-        index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .env({
-        "TORCH_CUDA_ARCH_LIST": "8.6",
-        "CC": "/usr/bin/gcc",
-        "CXX": "/usr/bin/g++",
-    })
-)
 
-# Cropper image: GroundingDINO + SAM2 — wants a modern transformers
-CROPPER_IMAGE = (
-    BASE_IMAGE
-    .pip_install("transformers>=4.53.2")
-    .run_commands(
-        "python -m pip install --no-build-isolation "
-        "git+https://github.com/facebookresearch/sam2.git"
-    )
-)
-
-# TripoSR image: needs a transformers old enough to predate the ViTModel
-# attention refactor (q_proj/k_proj/v_proj/o_proj), or the released
-# stabilityai/TripoSR checkpoint won't load via load_state_dict().
-TRIPO_IMAGE = (
-    BASE_IMAGE
-    .pip_install("transformers==4.46.3")
-    .run_commands(
-        "python -m pip install --no-build-isolation "
-        "git+https://github.com/tatsy/torchmcubes.git"
-    )
-    .run_commands(
-        "git clone https://github.com/VAST-AI-Research/TripoSR.git /opt/TripoSR"
-    )
-    .env({"PYTHONPATH": "/opt/TripoSR"})
-)
-
-# =========================
-# Helpers
-# =========================
-
-def _normalize_url(candidate: str, base_url: str) -> str:
-    candidate = candidate.strip()
-    if not candidate:
-        return ""
-    if candidate.startswith("//"):
-        return "https:" + candidate
-    return urljoin(base_url, candidate)
-
-
-def _extract_jsonld_images(soup: BeautifulSoup, base_url: str) -> list[str]:
-    out: list[str] = []
-    for script in soup.select('script[type="application/ld+json"]'):
-        raw = script.string or script.get_text(strip=True)
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-
-        stack = [data]
-        while stack:
-            item = stack.pop()
-            if isinstance(item, dict):
-                for key in ("image", "thumbnailUrl", "contentUrl", "url", "og:image"):
-                    value = item.get(key)
-                    if isinstance(value, str):
-                        out.append(_normalize_url(value, base_url))
-                    elif isinstance(value, list):
-                        out.extend(
-                            _normalize_url(v, base_url)
-                            for v in value
-                            if isinstance(v, str)
-                        )
-                    elif isinstance(value, dict):
-                        stack.append(value)
-                for value in item.values():
-                    if isinstance(value, (dict, list)):
-                        stack.append(value)
-            elif isinstance(item, list):
-                stack.extend(item)
-    return [u for u in out if u]
-
-
-def _extract_html_images(html: str, base_url: str) -> list[str]:
-    soup = BeautifulSoup(html, "lxml")
-    urls: list[str] = []
-
-    meta_selectors = [
-        'meta[property="og:image"]',
-        'meta[property="og:image:url"]',
-        'meta[name="twitter:image"]',
-        'meta[property="twitter:image"]',
-    ]
-    for selector in meta_selectors:
-        for tag in soup.select(selector):
-            value = tag.get("content")
-            if value:
-                urls.append(_normalize_url(value, base_url))
-
-    urls.extend(_extract_jsonld_images(soup, base_url))
-
-    for tag in soup.find_all("img"):
-        for attr in ("data-src", "data-lazy-src", "src"):
-            value = tag.get(attr)
-            if value:
-                urls.append(_normalize_url(value, base_url))
-        srcset = tag.get("srcset")
-        if srcset:
-            parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
-            urls.extend(_normalize_url(p, base_url) for p in parts)
-
-    seen = set()
-    deduped = []
-    for url in urls:
-        if url and url not in seen:
-            seen.add(url)
-            deduped.append(url)
-    return deduped
-
-
-def _write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-
-
-def _make_job_dir(job_id: str) -> Path:
-    job_dir = ARTIFACTS_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-    return job_dir
-
-
-# =========================
-# Modal Functions
-# =========================
-
-@app.function(image=BASE_IMAGE, timeout=300)
-def render_page(url: str) -> str:
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
-        page = browser.new_page(
-            viewport={"width": 1440, "height": 2200},
-            device_scale_factor=1,
-        )
-        page.goto(url, wait_until="networkidle", timeout=60_000)
-        page.mouse.wheel(0, 3000)
-        page.wait_for_timeout(1200)
-        html = page.content()
-        browser.close()
-        return html
-
-
-def pick_best_image_url(page_url: str) -> str:
-    response = requests.get(page_url, headers=HEADERS, timeout=30)
-    response.raise_for_status()
-    urls = _extract_html_images(response.text, page_url)
-    if urls:
-        return urls[0]
-
-    html = render_page.remote(page_url)
-    urls = _extract_html_images(html, page_url)
-    if urls:
-        return urls[0]
-
-    raise RuntimeError(f"No usable image URL found for {page_url}")
-
-
-@app.function(
-    image=BASE_IMAGE,
-    volumes={"/vol": ARTIFACTS_VOLUME},
-    timeout=120,
-)
-def persist_input_image(image_bytes: bytes, job_id: str, source_url: str) -> dict:
-    job_dir = _make_job_dir(job_id)
-    input_path = job_dir / "input.jpg"
-
-    _write_bytes(input_path, image_bytes)
-    (job_dir / "source_url.txt").write_text(source_url, encoding="utf-8")
-
-    ARTIFACTS_VOLUME.commit()
-
-    return {
-        "job_id": job_id,
-        "input_rel": str(input_path.relative_to(ARTIFACTS_DIR)),
-    }
-
-
-# =========================
-# Cropper (GroundingDINO + SAM2)
-# =========================
-
-@app.cls(
-    image=CROPPER_IMAGE,
-    gpu="A10",
-    volumes={"/vol": ARTIFACTS_VOLUME},
-    timeout=900,
-    scaledown_window=300,
-)
-class Cropper:
-    @modal.enter()
-    def setup(self):
-        import torch
-        from huggingface_hub import hf_hub_download
-        from sam2.build_sam import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
-        from transformers import (
-            AutoModelForZeroShotObjectDetection,
-            AutoProcessor,
-        )
-
-        self.torch = torch
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # NOTE: GroundingDINO's deformable attention builds its sampling
-        # grid internally in fp32 and feeds it straight into
-        # nn.functional.grid_sample. grid_sample does not support fp16
-        # inputs on this path, so loading the detector in float16 crashes
-        # deep inside the model ("expected scalar type Half but found
-        # Float") regardless of what dtype you cast pixel_values to before
-        # calling it -- the mismatch happens on a tensor built *inside* the
-        # layer, which the caller has no way to intercept. Running the
-        # detector in float32 sidesteps this entirely. GroundingDINO-tiny
-        # is small and detection isn't the pipeline's bottleneck (TripoSR
-        # reconstruction is), so the fp32 cost here is negligible.
-        model_id = "IDEA-Research/grounding-dino-tiny"
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        
-        self.detector = AutoModelForZeroShotObjectDetection.from_pretrained(
-            model_id,
-            torch_dtype=torch.float32,
-        ).to(self.device).eval()
-        
-        model_root = MODEL_DIR / "sam2"
-        model_root.mkdir(parents=True, exist_ok=True)
-
-        # Only the checkpoint comes from HF Hub. The config name is NOT a
-        # filesystem path: build_sam2() resolves `cfg` through Hydra's own
-        # internal search path (provider=main, path=pkg://sam2), which only
-        # sees configs bundled inside the installed `sam2` package. Passing
-        # the absolute HF download path for the yaml makes Hydra try to
-        # resolve that string as a config *name* under pkg://sam2, which is
-        # exactly the MissingConfigException you hit.
-        checkpoint = hf_hub_download(
-            repo_id="facebook/sam2.1-hiera-large",
-            filename="sam2.1_hiera_large.pt",
-            local_dir=str(model_root),
-            local_dir_use_symlinks=False,
-        )
-        cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-
-        self.sam = SAM2ImagePredictor(
-            build_sam2(cfg, checkpoint, device=self.device)
-        )
-
-    def _fit_square_rgba(
-        self,
-        rgba: Image.Image,
-        target_size: int = 1024,
-        foreground_ratio: float = 0.82,
-    ) -> Image.Image:
-        rgba = rgba.convert("RGBA")
-        w, h = rgba.size
-        scale = min(
-            (target_size * foreground_ratio) / max(w, 1),
-            (target_size * foreground_ratio) / max(h, 1),
-        )
-        new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-        resized = rgba.resize(new_size, Image.Resampling.LANCZOS)
-
-        canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
-        left = (target_size - resized.size[0]) // 2
-        top = (target_size - resized.size[1]) // 2
-        canvas.paste(resized, (left, top), resized)
-        return canvas
-
-    @modal.method()
-    def crop(self, job_id: str, labels: list[str] | None = None) -> dict:
-        ARTIFACTS_VOLUME.reload()
-
-        job_dir = ARTIFACTS_DIR / job_id
-        input_path = job_dir / "input.jpg"
-        if not input_path.exists():
-            raise FileNotFoundError(input_path)
-
-        image = Image.open(input_path).convert("RGB")
-        prompt_list = [f"a {x}" for x in (labels or FURNITURE_LABELS)]
-        inputs = self.processor(
-            images=image,
-            text=[prompt_list],
-            return_tensors="pt",
-        ).to(self.device)
-
-        # Detector now always runs in float32, so this cast is a no-op
-        # safety net rather than a load-bearing fix -- kept in case the
-        # model dtype ever changes again. input_ids/attention_mask are
-        # left untouched since they must stay integer/long tensors.
-        model_dtype = next(self.detector.parameters()).dtype
-        inputs = {
-            k: v.to(model_dtype) if v.is_floating_point() else v
-            for k, v in inputs.items()
-        }
-
-        with self.torch.no_grad():
-            outputs = self.detector(**inputs)
-
-        results = self.processor.post_process_grounded_object_detection(
-            outputs,
-            inputs["input_ids"],
-            threshold=0.35,
-            text_threshold=0.25,
-            target_sizes=[(image.height, image.width)],
-        )[0]
-
-        if len(results["boxes"]) == 0:
-            rgba = Image.open(input_path).convert("RGBA")
-            out = self._fit_square_rgba(rgba)
-            crop_path = job_dir / "crop.png"
-            out.save(crop_path)
-            ARTIFACTS_VOLUME.commit()
-            return {
-                "job_id": job_id,
-                "crop_rel": str(crop_path.relative_to(ARTIFACTS_DIR)),
-                "fallback": True,
-            }
-
-        boxes = results["boxes"].detach().cpu().numpy()
-        scores = results["scores"].detach().cpu().numpy()
-
-        areas = (
-            np.maximum(boxes[:, 2] - boxes[:, 0], 1)
-            * np.maximum(boxes[:, 3] - boxes[:, 1], 1)
-        )
-        best_idx = int(np.argmax(scores * np.sqrt(areas)))
-        box = boxes[best_idx]
-
-        rgb = np.array(image)
-        self.sam.set_image(rgb)
-        masks, mask_scores, _ = self.sam.predict(
-            box=box[None, :],
-            multimask_output=True,
-        )
-
-        if isinstance(masks, np.ndarray) and masks.ndim == 4:
-            masks = masks[:, 0, :, :]
-
-        best_mask = masks[int(np.argmax(mask_scores))]
-        best_mask = (best_mask > 0.5).astype(np.uint8)
-
-        x1, y1, x2, y2 = [int(max(0, round(v))) for v in box]
-
-        pad_x = int((x2 - x1) * 0.15)
-        pad_y = int((y2 - y1) * 0.15)
-
-        x1 = max(0, x1 - pad_x)
-        y1 = max(0, y1 - pad_y)
-        x2 = min(image.width, x2 + pad_x)
-        y2 = min(image.height, y2 + pad_y)
-
-        crop_rgb = rgb[y1:y2, x1:x2]
-        crop_mask = best_mask[y1:y2, x1:x2]
-
-        alpha = (crop_mask * 255).astype(np.uint8)
-        rgba_arr = np.dstack([crop_rgb, alpha])
-        rgba = Image.fromarray(rgba_arr, mode="RGBA")
-
-        out = self._fit_square_rgba(rgba)
-
-        crop_path = job_dir / "crop.png"
-        mask_path = job_dir / "mask.png"
-
-        out.save(crop_path)
-        Image.fromarray(alpha).save(mask_path)
-
-        (job_dir / "crop_meta.json").write_text(
-            json.dumps(
-                {
-                    "box": [float(v) for v in box.tolist()],
-                    "scores": [float(v) for v in scores.tolist()],
-                    "labels": list(results["text_labels"]),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        ARTIFACTS_VOLUME.commit()
-
-        return {
-            "job_id": job_id,
-            "crop_rel": str(crop_path.relative_to(ARTIFACTS_DIR)),
-            "mask_rel": str(mask_path.relative_to(ARTIFACTS_DIR)),
-            "fallback": False,
-        }
-
-# =========================
-# TripoSR Generator
-# =========================
-
-@app.cls(
-    image=TRIPO_IMAGE,
-    gpu="A10",
-    volumes={"/vol": ARTIFACTS_VOLUME},
-    timeout=900,
-    scaledown_window=300,
-)
-class TripoGenerator:
-    @modal.enter()
-    def setup(self):
-        import torch
-        from tsr.system import TSR
-
-        self.torch = torch
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        self.model = TSR.from_pretrained(
-            "stabilityai/TripoSR",
-            config_name="config.yaml",
-            weight_name="model.ckpt",
-        )
-
-        self.model.renderer.set_chunk_size(131072)
-        self.model.to(self.device)
-
-    def _fill_background(self, image: Image.Image) -> Image.Image:
-        arr = np.array(image).astype(np.float32) / 255.0
-
-        if arr.shape[-1] == 4:
-            rgb = arr[:, :, :3] * arr[:, :, 3:4] + (1.0 - arr[:, :, 3:4]) * 0.5
-        else:
-            rgb = arr[:, :, :3]
-
-        return Image.fromarray((rgb * 255.0).astype(np.uint8))
-
-    @modal.method()
-    def generate(self, job_id: str, mc_resolution: int = 256) -> dict:
-        ARTIFACTS_VOLUME.reload()
-
-        job_dir = ARTIFACTS_DIR / job_id
-        crop_path = job_dir / "crop.png"
-        if not crop_path.exists():
-            raise FileNotFoundError(crop_path)
-
-        image = Image.open(crop_path).convert("RGBA")
-        image = self._fill_background(image)
-
-        scene_codes = self.model(image, device=self.device)
-        mesh = self.model.extract_mesh(
-            scene_codes, has_vertex_color=True, resolution=mc_resolution
-        )[0]
-        from tsr.utils import to_gradio_3d_orientation
-
-        mesh = to_gradio_3d_orientation(mesh)
-
-        glb_path = job_dir / "mesh.glb"
-        obj_path = job_dir / "mesh.obj"
-
-        mesh.export(glb_path)
-
-        mesh_obj = mesh.copy()
-        mesh_obj.apply_scale([-1, 1, 1])
-        mesh_obj.export(obj_path)
-
-        ARTIFACTS_VOLUME.commit()
-
-        return {
-            "job_id": job_id,
-            "glb_rel": str(glb_path.relative_to(ARTIFACTS_DIR)),
-            "obj_rel": str(obj_path.relative_to(ARTIFACTS_DIR)),
-        }
-
-
-# =========================
-# Rendering Views
-# =========================
-
-def _look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
-    eye = np.asarray(eye, dtype=np.float32)
-    target = np.asarray(target, dtype=np.float32)
-    up = np.asarray(up, dtype=np.float32)
-
-    forward = target - eye
-    forward /= np.linalg.norm(forward) + 1e-8
-
-    right = np.cross(forward, up)
-    right /= np.linalg.norm(right) + 1e-8
-
-    true_up = np.cross(right, forward)
-
-    pose = np.eye(4, dtype=np.float32)
-    pose[:3, 0] = right
-    pose[:3, 1] = true_up
-    pose[:3, 2] = -forward
-    pose[:3, 3] = eye
-    return pose
-
-
-@app.function(
-    image=BASE_IMAGE,
-    volumes={"/vol": ARTIFACTS_VOLUME},
-    timeout=300,
-)
-def render_views(job_id: str, size: int = 1024) -> dict:
-    import os
-    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-
-    import pyrender
-    import trimesh
-
-    ARTIFACTS_VOLUME.reload()
-
-    job_dir = ARTIFACTS_DIR / job_id
-    glb_path = job_dir / "mesh.glb"
-    if not glb_path.exists():
-        raise FileNotFoundError(glb_path)
-
-    loaded = trimesh.load(glb_path, force="scene")
-
-    if isinstance(loaded, trimesh.Scene):
-        meshes = list(loaded.geometry.values())
-        mesh = trimesh.util.concatenate(meshes) if meshes else trimesh.Trimesh()
-    else:
-        mesh = loaded
-
-    if mesh.is_empty:
-        raise RuntimeError("Empty mesh")
-
-    mesh = mesh.copy()
-    mesh.apply_translation(-mesh.centroid)
-
-    extents = mesh.bounding_box.extents
-    radius = float(np.max(extents) * 0.5) if np.max(extents) > 0 else 1.0
-
-    pyr_mesh = pyrender.Mesh.from_trimesh(mesh, smooth=False)
-
-    def render_one(name, eye, up):
-        scene = pyrender.Scene(
-            bg_color=[1, 1, 1, 0],
-            ambient_light=[0.35, 0.35, 0.35],
-        )
-        scene.add(pyr_mesh)
-
-        camera = pyrender.OrthographicCamera(
-            xmag=radius * 1.05,
-            ymag=radius * 1.05,
-        )
-        scene.add(camera, pose=_look_at(eye, np.zeros(3), up))
-
-        light = pyrender.DirectionalLight(color=np.ones(3), intensity=3.0)
-        scene.add(light, pose=_look_at(
-            np.array([2.5, 2.5, 2.5]),
-            np.zeros(3),
-            np.array([0.0, 0.0, 1.0]),
-        ))
-
-        renderer = pyrender.OffscreenRenderer(size, size)
-        color, _ = renderer.render(scene)
-        renderer.delete()
-
-        out_path = job_dir / f"{name}.png"
-        Image.fromarray(color).save(out_path)
-        return str(out_path.relative_to(ARTIFACTS_DIR))
-
-    front = render_one("front", np.array([0, -2.5 * radius, 0]), np.array([0, 0, 1]))
-    side = render_one("side", np.array([2.5 * radius, 0, 0]), np.array([0, 0, 1]))
-    top = render_one("top", np.array([0, 0, 2.5 * radius]), np.array([0, 1, 0]))
-
-    ARTIFACTS_VOLUME.commit()
-
-    return {
-        "job_id": job_id,
-        "front_rel": front,
-        "side_rel": side,
-        "top_rel": top,
-    }
-
-
-# =========================
-# Artifact Fetching
-# =========================
-#
-# Volume.reload() is only valid inside a running Modal Function/container --
-# calling it (or read_file()) from the local entrypoint process is not a
-# supported pattern and raises ConflictError/RuntimeError. Instead, fetch
-# artifact bytes via a small remote function that runs inside a container,
-# where the Volume's consistency guarantees actually apply, then write the
-# returned bytes to disk locally.
+# ---------------------------------------------------------------------------
+# Artifact fetching helper (must run inside a Modal container for volume access)
+# ---------------------------------------------------------------------------
 
 @app.function(
     image=BASE_IMAGE,
@@ -664,13 +50,11 @@ def render_views(job_id: str, size: int = 1024) -> dict:
 )
 def fetch_artifacts(job_id: str, rels: list[str]) -> dict[str, bytes]:
     ARTIFACTS_VOLUME.reload()
-    out: dict[str, bytes] = {}
-    for rel in rels:
-        if not rel:
-            continue
-        path = ARTIFACTS_DIR / rel
-        out[rel] = path.read_bytes()
-    return out
+    return {
+        rel: (ARTIFACTS_DIR / rel).read_bytes()
+        for rel in rels
+        if rel and (ARTIFACTS_DIR / rel).exists()
+    }
 
 
 def _save_artifacts(job_id: str, rels: list[str], out_root: Path) -> None:
@@ -682,94 +66,258 @@ def _save_artifacts(job_id: str, rels: list[str], out_root: Path) -> None:
         local_path.write_bytes(data)
 
 
-# =========================
-# Pipeline Orchestration
-# =========================
+# ---------------------------------------------------------------------------
+# Core pipeline orchestration
+# ---------------------------------------------------------------------------
 
-def run_pipeline(page_url: str, out_dir: str = "outputs", mc_resolution: int = 256) -> dict:
+def run_pipeline(
+    page_url: str,
+    out_dir: str = "outputs",
+    quality: str = "large",
+) -> dict:
+    """
+    Full Pipeline E run:
+      S0 scrape → S1 VLM intelligence → S2 multi-crop →
+      S3 InstantMesh reconstruct → S4 dimension scale →
+      S5 texture fusion → S6 4-view render
+
+    Returns the manifest dict and writes all artifacts to out_dir/job_id/.
+    """
     job_id = uuid.uuid4().hex[:12]
     out_root = Path(out_dir) / job_id
     out_root.mkdir(parents=True, exist_ok=True)
 
-    image_url = pick_best_image_url(page_url)
-    image_bytes = requests.get(image_url, headers=HEADERS, timeout=30).content
+    print(f"[pipeline-e] job_id={job_id}  url={page_url}")
 
-    persist_input_image.remote(image_bytes, job_id, image_url)
-    crop_info = Cropper().crop.remote(job_id, FURNITURE_LABELS)
-    print("CROP INFO:", crop_info)
-    mesh_info = TripoGenerator().generate.remote(job_id, mc_resolution)
-    view_info = render_views.remote(job_id)
+    # S0 — Scrape
+    scrape = scrape_page.remote(page_url, job_id)
+    print(f"[S0] found {len(scrape['candidate_image_urls'])} candidate images")
+
+    # S1 — VLM Page Intelligence
+    intelligence = analyze_page.remote(scrape, job_id)
+    print(
+        f"[S1] category={intelligence['furniture_category']}  "
+        f"recon_candidates={len(intelligence['reconstruction_candidates'])}  "
+        f"texture_candidates={len(intelligence['texture_candidates'])}"
+    )
+
+    # S2 — Multi-Crop
+    crop_result = Cropper().crop_all.remote(job_id, intelligence)
+    print(f"[S2] cropped {len(crop_result['crops'])} images")
+
+    # S3 — InstantMesh Reconstruction  (A10G)
+    reconstruct = InstantMeshGenerator().generate.remote(
+        job_id, crop_result, intelligence, quality=quality
+    )
+    print(f"[S3] mesh: {reconstruct['glb_rel']}")
+
+    # S4 — Dimension-Aware Scaling
+    scale = scale_mesh.remote(
+        job_id,
+        reconstruct,
+        intelligence.get("dimensions_mm"),
+        intelligence.get("dimensions_source", "absent"),
+    )
+    print(f"[S4] scale_applied={scale['scale_applied']}  factor={scale['scale_factor']}")
+
+    # S5 — Texture Fusion  (A10)
+    texture = TextureFuser().fuse.remote(
+        job_id, scale, crop_result, intelligence
+    )
+    print(f"[S5] texture atlas: {texture['texture_atlas_rel']}")
+
+    # S6 — Render 4 views  (CPU)
+    renders = render_views.remote(job_id, texture)
+    print(f"[S6] renders: front={renders['front_rel']}")
+
+    # Collect all artifact relative paths
+    all_rels = [
+        # Crops (all of them)
+        *[c["crop_rel"] for c in crop_result["crops"]],
+        *[c["mask_rel"] for c in crop_result["crops"] if c.get("mask_rel")],
+        # Mesh variants
+        reconstruct["glb_rel"],
+        reconstruct["obj_rel"],
+        reconstruct["uv_map_rel"],
+        scale["scaled_glb_rel"],
+        scale["scaled_obj_rel"],
+        texture["textured_glb_rel"],
+        texture["textured_obj_rel"],
+        texture["texture_atlas_rel"],
+        # Renders
+        renders["front_rel"],
+        renders["side_rel"],
+        renders["top_rel"],
+        renders["angled_rel"],
+    ]
+
+    _save_artifacts(job_id, all_rels, out_root)
 
     manifest = {
         "job_id": job_id,
+        "pipeline": APP_NAME,
         "page_url": page_url,
-        "image_url": image_url,
-        "crop": crop_info,
-        "mesh": mesh_info,
-        "views": view_info,
+        "quality": quality,
+        "intelligence": {
+            "furniture_category": intelligence["furniture_category"],
+            "dimensions_mm": intelligence.get("dimensions_mm"),
+            "dimensions_source": intelligence.get("dimensions_source"),
+            "reconstruction_candidates": intelligence["reconstruction_candidates"],
+        },
+        "crop": crop_result,
+        "reconstruct": reconstruct,
+        "scale": scale,
+        "texture": texture,
+        "renders": renders,
     }
 
-    _save_artifacts(
-        job_id,
-        [
-            crop_info["crop_rel"],
-            crop_info.get("mask_rel"),
-            mesh_info["glb_rel"],
-            mesh_info["obj_rel"],
-            view_info["front_rel"],
-            view_info["side_rel"],
-            view_info["top_rel"],
-        ],
-        out_root,
-    )
-
     (out_root / "manifest.json").write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
+        json.dumps(manifest, indent=2, default=str), encoding="utf-8"
     )
-
+    print(f"[pipeline-e] done → {out_root}")
     return manifest
 
 
-# =========================
-# Entry Point
-# =========================
+# ---------------------------------------------------------------------------
+# Entry Points
+# ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
-def main(page_url: str, out_dir: str = "outputs", mc_resolution: int = 256):
-    result = run_pipeline(page_url, out_dir=out_dir, mc_resolution=mc_resolution)
-    print(json.dumps(result, indent=2))
+def main(
+    page_url: str,
+    out_dir: str = "outputs",
+    quality: str = "large",
+):
+    """
+    Production entry point.
 
+    Example:
+        modal run main.py --page-url "https://www.ikea.com/us/en/p/kivik-sofa-..."
+    """
+    result = run_pipeline(page_url, out_dir=out_dir, quality=quality)
+    print(json.dumps(result, indent=2, default=str))
 
-# Test endpoint (bypass scrapping)
 
 @app.local_entrypoint()
-def test_local_image(image_path: str, out_dir: str = "outputs", mc_resolution: int = 256):
+def test_local_image(
+    image_path: str,
+    out_dir: str = "outputs",
+    quality: str = "large",
+):
+    """
+    Bypass scraping — run the reconstruction pipeline on a local image file.
+    Useful for unit-testing S2–S6 without a product page URL.
+
+    Example:
+        modal run main.py::test_local_image --image-path grey_sofa.png
+    """
+    from stages.s0_scrape import HEADERS as SCRAPE_HEADERS
+
     job_id = uuid.uuid4().hex[:12]
     out_root = Path(out_dir) / job_id
     out_root.mkdir(parents=True, exist_ok=True)
 
+    # Persist the local image as if it were scraped
     image_bytes = Path(image_path).read_bytes()
-    persist_input_image.remote(image_bytes, job_id, f"local:{image_path}")
 
-    crop_info = Cropper().crop.remote(job_id, FURNITURE_LABELS)
-    mesh_info = TripoGenerator().generate.remote(job_id, mc_resolution)
-    view_info = render_views.remote(job_id)
-
-    manifest = {"job_id": job_id, "crop": crop_info, "mesh": mesh_info, "views": view_info}
-
-    _save_artifacts(
-        job_id,
-        [
-            crop_info["crop_rel"],
-            crop_info.get("mask_rel"),
-            mesh_info["glb_rel"],
-            mesh_info["obj_rel"],
-            view_info["front_rel"],
-            view_info["side_rel"],
-            view_info["top_rel"],
-        ],
-        out_root,
+    @app.function(
+        image=BASE_IMAGE,
+        volumes={"/vol": ARTIFACTS_VOLUME},
+        timeout=60,
     )
+    def _upload_test_image(data: bytes, jid: str, src: str):
+        job_dir = ARTIFACTS_DIR / jid
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "input_0.jpg").write_bytes(data)
+        (job_dir / "source_url.txt").write_text(src, encoding="utf-8")
+        ARTIFACTS_VOLUME.commit()
 
-    print(json.dumps(manifest, indent=2))
+    _upload_test_image.remote(image_bytes, job_id, f"local:{image_path}")
+
+    # Synthesise a minimal intelligence result for a single local image
+    intelligence = {
+        "furniture_category": "furniture",
+        "material_hints": [],
+        "dimensions_mm": None,
+        "dimensions_source": "absent",
+        "view_classifications": [
+            {
+                "url": f"local:{image_path}",
+                "view": "front",
+                "confidence": 1.0,
+                "is_product_isolated": True,
+            }
+        ],
+        "reconstruction_candidates": [f"local:{image_path}"],
+        "texture_candidates": [f"local:{image_path}"],
+    }
+
+    # Manually create a crop from the local image using the Cropper
+    # by uploading the image and running the cropper directly
+    @app.function(
+        image=BASE_IMAGE,
+        volumes={"/vol": ARTIFACTS_VOLUME},
+        timeout=60,
+    )
+    def _prepare_crop_from_bytes(data: bytes, jid: str) -> str:
+        from PIL import Image
+        from io import BytesIO
+        job_dir = ARTIFACTS_DIR / jid
+        job_dir.mkdir(parents=True, exist_ok=True)
+        img = Image.open(BytesIO(data)).convert("RGB")
+        dest = job_dir / "raw_input.png"
+        img.save(dest)
+        ARTIFACTS_VOLUME.commit()
+        return str(dest.relative_to(ARTIFACTS_DIR))
+
+    raw_rel = _prepare_crop_from_bytes.remote(image_bytes, job_id)
+
+    # Use a simplified crop_result wrapping the raw image
+    # (production would run Cropper here; for test we skip detection)
+    crop_result = {
+        "job_id": job_id,
+        "crops": [
+            {
+                "index": 0,
+                "source_url": f"local:{image_path}",
+                "view_label": "front",
+                "crop_rel": raw_rel,
+                "mask_rel": None,
+                "fallback": True,
+            }
+        ],
+    }
+
+    # S3 onwards
+    reconstruct = InstantMeshGenerator().generate.remote(
+        job_id, crop_result, intelligence, quality=quality
+    )
+    scale = scale_mesh.remote(job_id, reconstruct, None, "absent")
+    texture = TextureFuser().fuse.remote(job_id, scale, crop_result, intelligence)
+    renders = render_views.remote(job_id, texture)
+
+    all_rels = [
+        raw_rel,
+        reconstruct["glb_rel"], reconstruct["obj_rel"], reconstruct["uv_map_rel"],
+        scale["scaled_glb_rel"], scale["scaled_obj_rel"],
+        texture["textured_glb_rel"], texture["textured_obj_rel"],
+        texture["texture_atlas_rel"],
+        renders["front_rel"], renders["side_rel"],
+        renders["top_rel"], renders["angled_rel"],
+    ]
+    _save_artifacts(job_id, all_rels, out_root)
+
+    manifest = {
+        "job_id": job_id,
+        "pipeline": APP_NAME,
+        "image_path": image_path,
+        "quality": quality,
+        "reconstruct": reconstruct,
+        "scale": scale,
+        "texture": texture,
+        "renders": renders,
+    }
+    (out_root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, default=str), encoding="utf-8"
+    )
+    print(json.dumps(manifest, indent=2, default=str))

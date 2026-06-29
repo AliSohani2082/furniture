@@ -1,27 +1,28 @@
-modal
+# Pipeline E — local dev / tooling dependencies
+# Note: GPU-side packages (torch, xformers, nvdiffrast, sam2, InstantMesh)
+# are installed inside Modal container images defined in images.py, not here.
+# This file covers what you need to run tests and linting locally.
 
-numpy
+modal
 requests
 beautifulsoup4
 lxml
-
 pillow
-
+pillow-avif-plugin
+numpy
 trimesh
 pyrender
 pygltflib
-
 opencv-python-headless
-
 rembg
-
-playwright
-
-torch
-torchvision
-
-transformers>=4.53.2
 accelerate
 huggingface_hub
-
-huggingface-hub
+playwright
+einops
+omegaconf
+imageio
+onnxruntime
+openai
+open-clip-torch
+scipy
+scikit-image
