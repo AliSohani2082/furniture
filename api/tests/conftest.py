@@ -7,7 +7,7 @@ os.environ["MINIO_ROOT_PASSWORD"] = "changeme"
 
 import pytest
 from httpx import AsyncClient, ASGITransport
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 from compute import ComputeBackend
 
@@ -66,7 +66,9 @@ async def client(mock_backend):
     # Initialise DB (lifespan is not triggered by ASGITransport)
     await init_db()
     # Patch ensure_bucket and upload_bytes so unit tests don't need a real MinIO instance running
-    with patch("main.ensure_bucket"), patch("main.upload_bytes", return_value="fake/key"):
+    with patch("main.ensure_bucket"), \
+         patch("main.upload_bytes", return_value="fake/key"), \
+         patch("main.run_pipeline", new_callable=AsyncMock):
         async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test") as c:
             yield c
     # Teardown: drop and recreate tables so each test starts with a clean DB
