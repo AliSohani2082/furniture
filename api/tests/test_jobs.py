@@ -51,3 +51,21 @@ async def test_get_job_after_create(client: AsyncClient):
     assert body["id"] == job_id
     assert body["status"] == "queued"
     assert body["input_type"] == "url"
+
+
+@pytest.mark.asyncio
+async def test_delete_job(client: AsyncClient):
+    create = await client.post("/jobs", data={"url": "https://example.com/chair"})
+    assert create.status_code == 201
+    job_id = create.json()["id"]
+
+    delete = await client.delete(f"/jobs/{job_id}")
+    assert delete.status_code == 200
+    body = delete.json()
+    assert body["id"] == job_id
+    assert body["status"] == "cancelled"
+
+    # Verify the job is actually cancelled in DB
+    get = await client.get(f"/jobs/{job_id}")
+    assert get.status_code == 200
+    assert get.json()["status"] == "cancelled"

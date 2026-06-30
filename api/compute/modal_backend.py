@@ -53,7 +53,7 @@ def _write_image_to_volume(image_bytes: bytes, job_id: str) -> str:
 
 async def _run_in_executor(fn, *args):
     """Run a blocking Modal .remote() call without blocking the event loop."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, fn, *args)
 
 
@@ -110,8 +110,7 @@ class ModalBackend:
     ) -> dict:
         from stages.s3_reconstruct import InstantMeshGenerator
         fn = partial(InstantMeshGenerator().generate.remote, job_id, crop_result, intel_result, quality=quality)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, fn)
+        return await _run_in_executor(fn)
 
     async def scale(self, job_id: str, reconstruct_result: dict, intel_result: dict) -> dict:
         from stages.s4_scale import scale_mesh
@@ -124,8 +123,7 @@ class ModalBackend:
     ) -> dict:
         from stages.s5_texture import TextureFuser
         fn = partial(TextureFuser().fuse.remote, job_id, scale_result, crop_result, intel_result)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, fn)
+        return await _run_in_executor(fn)
 
     async def render(self, job_id: str, texture_result: dict) -> dict:
         from stages.s6_render import render_views

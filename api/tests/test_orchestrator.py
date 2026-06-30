@@ -67,6 +67,9 @@ async def test_run_pipeline_image_job_skips_scrape():
         session.add(job)
         await session.commit()
 
+    queue: asyncio.Queue = asyncio.Queue()
+    subscribe_job(job_id, queue)
+
     with patch("orchestrator.upload_bytes", return_value="fake-key"), \
          patch("orchestrator.presigned_url", return_value="http://minio/fake"), \
          patch("orchestrator._download_input_image", return_value=b"fake_bytes"):
@@ -75,6 +78,15 @@ async def test_run_pipeline_image_job_skips_scrape():
     async with SessionLocal() as session:
         job = await session.get(Job, job_id)
         assert job.status == "completed"
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+
+    event_types = [e["type"] for e in events]
+    assert "job_completed" in event_types
+    assert event_types.count("stage_started") >= 7   # all 7 stages (S0-S2 are synthetic)
+    assert event_types.count("stage_completed") >= 7
 
 
 @pytest.mark.asyncio

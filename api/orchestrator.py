@@ -158,6 +158,12 @@ async def run_pipeline(job_id: str, backend: ComputeBackend) -> None:
             _push_completed(job_id, STAGES[1][0], STAGES[1][1], {})
             _push_completed(job_id, STAGES[2][0], STAGES[2][1], {})
 
+        # Check for cancellation before the post-branch stages
+        async with SessionLocal() as s:
+            fresh = await s.get(Job, job_id)
+            if fresh.status == "cancelled":
+                return
+
         # --- S3: Reconstruct ---
         _push_started(job_id, *STAGES[3])
         recon_result = await backend.reconstruct(job_id, crop_result, intel_result, "large")
