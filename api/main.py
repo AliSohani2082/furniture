@@ -6,11 +6,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from db import init_db
+from storage import ensure_bucket
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    ensure_bucket()
     yield
 
 
