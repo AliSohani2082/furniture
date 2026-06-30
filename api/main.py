@@ -5,7 +5,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi import FastAPI
@@ -14,21 +14,17 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from compute import ComputeBackend
-from db import Job, SessionLocal, get_session, init_db
+from compute.modal_backend import ModalBackend
+from db import Job, get_session, init_db
 from orchestrator import run_pipeline, subscribe_job, unsubscribe_job
 from storage import ensure_bucket, presigned_url, upload_bytes
 
 # Default backend — replaced in tests via `main.backend = mock_backend`.
-# ModalBackend is imported lazily to avoid pulling in Modal/stages at import time.
-backend: ComputeBackend | None = None
+backend: ComputeBackend = ModalBackend()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global backend
-    if backend is None:
-        from compute.modal_backend import ModalBackend
-        backend = ModalBackend()
     await init_db()
     ensure_bucket()
     yield
@@ -104,7 +100,7 @@ async def cancel_job(job_id: str, session: AsyncSession = Depends(get_session)):
     if not job:
         raise HTTPException(404, "Job not found")
     await session.execute(
-        update(Job).where(Job.id == job_id).values(status="cancelled", updated_at=datetime.utcnow())
+        update(Job).where(Job.id == job_id).values(status="cancelled", updated_at=datetime.now(timezone.utc))
     )
     await session.commit()
     return {"id": job_id, "status": "cancelled"}

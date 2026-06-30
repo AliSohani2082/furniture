@@ -3,15 +3,35 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import JSON, SmallInteger, Text
+from sqlalchemy import JSON, SmallInteger, Text, TypeDecorator
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.types import JSON as JSONType
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class ArrayOfText(TypeDecorator):
+    """ARRAY(Text) on PostgreSQL, JSON on SQLite (for test portability)."""
+
+    impl = JSONType
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(ARRAY(Text()))
+        return dialect.type_descriptor(JSONType())
+
+    def process_bind_param(self, value, dialect):
+        return value
+
+    def process_result_value(self, value, dialect):
+        return value if value is not None else []
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
@@ -27,8 +47,8 @@ class Job(Base):
     __tablename__ = "jobs"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=lambda: str(uuid.uuid4()))
-    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     # Input
     input_type: Mapped[str] = mapped_column(Text)        # 'url' | 'image'
@@ -45,9 +65,9 @@ class Job(Base):
     furniture_category: Mapped[str | None] = mapped_column(Text, nullable=True)
     dimensions_mm: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
-    # S2 crops (parallel arrays — stored as JSON for SQLite/Postgres portability)
-    crop_s3_keys: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
-    mask_s3_keys: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    # S2 crops (parallel arrays — ARRAY(Text) on PostgreSQL, JSON on SQLite)
+    crop_s3_keys: Mapped[list[str] | None] = mapped_column(ArrayOfText, nullable=True)
+    mask_s3_keys: Mapped[list[str] | None] = mapped_column(ArrayOfText, nullable=True)
 
     # S3–S5 mesh outputs
     mesh_glb_s3_key: Mapped[str | None] = mapped_column(Text, nullable=True)

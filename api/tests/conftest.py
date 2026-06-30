@@ -5,7 +5,6 @@ os.environ["MINIO_BUCKET"] = "test-furnitur"
 os.environ["MINIO_ROOT_USER"] = "minioadmin"
 os.environ["MINIO_ROOT_PASSWORD"] = "changeme"
 
-import asyncio
 import pytest
 from httpx import AsyncClient, ASGITransport
 from unittest.mock import patch
@@ -62,7 +61,7 @@ def mock_backend():
 @pytest.fixture
 async def client(mock_backend):
     import main
-    from db import init_db
+    from db import Base, engine, init_db
     main.backend = mock_backend   # inject mock before app starts
     # Initialise DB (lifespan is not triggered by ASGITransport)
     await init_db()
@@ -70,3 +69,7 @@ async def client(mock_backend):
     with patch("main.ensure_bucket"), patch("main.upload_bytes", return_value="fake/key"):
         async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test") as c:
             yield c
+    # Teardown: drop and recreate tables so each test starts with a clean DB
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)

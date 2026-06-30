@@ -2,24 +2,17 @@
 """
 Modal implementation of ComputeBackend.
 Wraps all .remote() calls in run_in_executor to avoid blocking FastAPI's event loop.
+
+Stage imports are deferred to each method body so that importing this module
+at the top level of main.py does not pull in Modal/stages at import time.
 """
 from __future__ import annotations
 
 import asyncio
-import uuid
 from functools import partial
 
 import modal
 
-# Register all Modal stage functions with the app by importing them.
-# The stages/ directory is copied into the Docker image by api/Dockerfile.
-from stages.s0_scrape import scrape_page
-from stages.s1_intelligence import analyze_page
-from stages.s2_crop import Cropper
-from stages.s3_reconstruct import InstantMeshGenerator
-from stages.s4_scale import scale_mesh
-from stages.s5_texture import TextureFuser
-from stages.s6_render import render_views
 from images import ARTIFACTS_DIR, ARTIFACTS_VOLUME, BASE_IMAGE, app as modal_app
 
 # A small Modal function for reading artifacts out of the Modal Volume.
@@ -68,12 +61,15 @@ class ModalBackend:
     """Implements ComputeBackend using the Modal SDK."""
 
     async def scrape(self, page_url: str, job_id: str) -> dict:
+        from stages.s0_scrape import scrape_page
         return await _run_in_executor(scrape_page.remote, page_url, job_id)
 
     async def analyze(self, scrape_result: dict, job_id: str) -> dict:
+        from stages.s1_intelligence import analyze_page
         return await _run_in_executor(analyze_page.remote, scrape_result, job_id)
 
     async def crop(self, job_id: str, intel_result: dict) -> dict:
+        from stages.s2_crop import Cropper
         return await _run_in_executor(Cropper().crop_all.remote, job_id, intel_result)
 
     async def prepare_image(self, image_bytes: bytes, job_id: str) -> tuple[dict, dict]:
@@ -112,11 +108,13 @@ class ModalBackend:
     async def reconstruct(
         self, job_id: str, crop_result: dict, intel_result: dict, quality: str
     ) -> dict:
+        from stages.s3_reconstruct import InstantMeshGenerator
         fn = partial(InstantMeshGenerator().generate.remote, job_id, crop_result, intel_result, quality=quality)
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, fn)
 
     async def scale(self, job_id: str, reconstruct_result: dict, intel_result: dict) -> dict:
+        from stages.s4_scale import scale_mesh
         dims = intel_result.get("dimensions_mm")
         source = intel_result.get("dimensions_source", "absent")
         return await _run_in_executor(scale_mesh.remote, job_id, reconstruct_result, dims, source)
@@ -124,11 +122,13 @@ class ModalBackend:
     async def texture(
         self, job_id: str, scale_result: dict, crop_result: dict, intel_result: dict
     ) -> dict:
+        from stages.s5_texture import TextureFuser
         fn = partial(TextureFuser().fuse.remote, job_id, scale_result, crop_result, intel_result)
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, fn)
 
     async def render(self, job_id: str, texture_result: dict) -> dict:
+        from stages.s6_render import render_views
         return await _run_in_executor(render_views.remote, job_id, texture_result)
 
     async def fetch_files(self, job_id: str, rels: list[str]) -> dict[str, bytes]:
