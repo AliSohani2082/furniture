@@ -46,7 +46,7 @@ def _download_image(url: str) -> Image.Image:
 
 @app.cls(
     image=CROPPER_IMAGE,
-    gpu="A10",
+    gpu="A10G",
     volumes={"/vol": ARTIFACTS_VOLUME},
     timeout=900,
     scaledown_window=300,

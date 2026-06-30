@@ -198,6 +198,36 @@ def main(
     print(json.dumps(result, indent=2, default=str))
 
 
+@app.function(
+    image=BASE_IMAGE,
+    volumes={"/vol": ARTIFACTS_VOLUME},
+    timeout=60,
+)
+def _upload_test_image(data: bytes, jid: str, src: str):
+    job_dir = ARTIFACTS_DIR / jid
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "input_0.jpg").write_bytes(data)
+    (job_dir / "source_url.txt").write_text(src, encoding="utf-8")
+    ARTIFACTS_VOLUME.commit()
+
+
+@app.function(
+    image=BASE_IMAGE,
+    volumes={"/vol": ARTIFACTS_VOLUME},
+    timeout=60,
+)
+def _prepare_crop_from_bytes(data: bytes, jid: str) -> str:
+    from PIL import Image
+    from io import BytesIO
+    job_dir = ARTIFACTS_DIR / jid
+    job_dir.mkdir(parents=True, exist_ok=True)
+    img = Image.open(BytesIO(data)).convert("RGB")
+    dest = job_dir / "raw_input.png"
+    img.save(dest)
+    ARTIFACTS_VOLUME.commit()
+    return str(dest.relative_to(ARTIFACTS_DIR))
+
+
 @app.local_entrypoint()
 def test_local_image(
     image_path: str,
@@ -211,26 +241,11 @@ def test_local_image(
     Example:
         modal run main.py::test_local_image --image-path grey_sofa.png
     """
-    from stages.s0_scrape import HEADERS as SCRAPE_HEADERS
-
     job_id = uuid.uuid4().hex[:12]
     out_root = Path(out_dir) / job_id
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # Persist the local image as if it were scraped
     image_bytes = Path(image_path).read_bytes()
-
-    @app.function(
-        image=BASE_IMAGE,
-        volumes={"/vol": ARTIFACTS_VOLUME},
-        timeout=60,
-    )
-    def _upload_test_image(data: bytes, jid: str, src: str):
-        job_dir = ARTIFACTS_DIR / jid
-        job_dir.mkdir(parents=True, exist_ok=True)
-        (job_dir / "input_0.jpg").write_bytes(data)
-        (job_dir / "source_url.txt").write_text(src, encoding="utf-8")
-        ARTIFACTS_VOLUME.commit()
 
     _upload_test_image.remote(image_bytes, job_id, f"local:{image_path}")
 
@@ -251,24 +266,6 @@ def test_local_image(
         "reconstruction_candidates": [f"local:{image_path}"],
         "texture_candidates": [f"local:{image_path}"],
     }
-
-    # Manually create a crop from the local image using the Cropper
-    # by uploading the image and running the cropper directly
-    @app.function(
-        image=BASE_IMAGE,
-        volumes={"/vol": ARTIFACTS_VOLUME},
-        timeout=60,
-    )
-    def _prepare_crop_from_bytes(data: bytes, jid: str) -> str:
-        from PIL import Image
-        from io import BytesIO
-        job_dir = ARTIFACTS_DIR / jid
-        job_dir.mkdir(parents=True, exist_ok=True)
-        img = Image.open(BytesIO(data)).convert("RGB")
-        dest = job_dir / "raw_input.png"
-        img.save(dest)
-        ARTIFACTS_VOLUME.commit()
-        return str(dest.relative_to(ARTIFACTS_DIR))
 
     raw_rel = _prepare_crop_from_bytes.remote(image_bytes, job_id)
 

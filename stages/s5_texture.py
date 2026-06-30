@@ -40,7 +40,7 @@ _CX = _CY = 160.0
 
 @app.cls(
     image=TEXTURE_IMAGE,
-    gpu="A10",
+    gpu="A10G",
     volumes={"/vol": ARTIFACTS_VOLUME},
     timeout=600,
     scaledown_window=180,
@@ -221,7 +221,10 @@ class TextureFuser:
         # Load initial UV atlas from the mesh (baked by InstantMesh)
         uv_map_path = job_dir / "uv_map.png"
         if uv_map_path.exists():
-            existing_tex = np.array(PILImage.open(uv_map_path).convert("RGB"), dtype=np.float32) / 255.0
+            pil_tex = PILImage.open(uv_map_path).convert("RGB")
+            if pil_tex.size != (atlas_size, atlas_size):
+                pil_tex = pil_tex.resize((atlas_size, atlas_size), PILImage.LANCZOS)
+            existing_tex = np.array(pil_tex, dtype=np.float32) / 255.0
         else:
             existing_tex = np.zeros((atlas_size, atlas_size, 3), dtype=np.float32)
 

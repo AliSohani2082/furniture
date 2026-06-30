@@ -168,8 +168,19 @@ class InstantMeshGenerator:
 
         state_dict = torch.load(ckpt_path, map_location="cpu")
         state_dict = state_dict.get("state_dict", state_dict)
+        # Lightning checkpoints wrap weights under 'lrm_generator.' — strip it
+        if any(k.startswith("lrm_generator.") for k in state_dict):
+            state_dict = {
+                k[len("lrm_generator."):] if k.startswith("lrm_generator.") else k: v
+                for k, v in state_dict.items()
+            }
         model.load_state_dict(state_dict, strict=True)
         model = model.to(self.device).eval()
+
+        # geometry is not in state_dict (plain Python object, not nn.Module).
+        # init_flexicubes_geometry creates it with tensors on the right device.
+        model.init_flexicubes_geometry(self.device)
+        print(f"[S3] FlexiCubesGeometry initialised on {self.device}")
 
         self._models[quality] = model
         return model
@@ -181,15 +192,33 @@ class InstantMeshGenerator:
             return self._models[key]
 
         import torch
-        from diffusers import DiffusionPipeline
+        from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
 
-        config = self._configs[quality]
+        # config.infer_config.unet_path is the fine-tuned UNet ckpt, not the pipeline.
+        # The base Zero123++ pipeline is always sudo-ai/zero123plus-v1.2.
         pipe = DiffusionPipeline.from_pretrained(
-            config.infer_config.unet_path,
-            custom_pipeline=config.infer_config.custom_pipeline,
+            "sudo-ai/zero123plus-v1.2",
+            custom_pipeline="/opt/InstantMesh/zero123plus",
             torch_dtype=torch.float16,
-        ).to(self.device)
+        )
+        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
+            pipe.scheduler.config, timestep_spacing="trailing"
+        )
 
+        # Load the InstantMesh fine-tuned UNet weights on top of the base model
+        try:
+            from huggingface_hub import hf_hub_download
+            unet_ckpt = hf_hub_download(
+                repo_id="TencentARC/InstantMesh",
+                filename="checkpoints/diffusion_pytorch_model.bin",
+            )
+            state_dict = torch.load(unet_ckpt, map_location="cpu")
+            pipe.unet.load_state_dict(state_dict)
+            print("[S3] Loaded InstantMesh fine-tuned Zero123++ UNet")
+        except Exception as exc:
+            print(f"[S3] Fine-tuned UNet not available, using base Zero123++: {exc}")
+
+        pipe = pipe.to(self.device)
         self._models[key] = pipe
         return pipe
 
@@ -278,6 +307,12 @@ class InstantMeshGenerator:
             images_tensor, cameras_tensor = self._run_zero123_plus(
                 crop_paths[0], quality
             )
+            # Offload Zero123++ pipeline to CPU before the memory-heavy LRM step
+            pipe_key = f"pipeline_{quality}"
+            if pipe_key in self._models:
+                self._models[pipe_key].to("cpu")
+                torch.cuda.empty_cache()
+                print("[S3] Zero123++ pipeline offloaded to CPU")
         else:
             # Multi-view mode: use real images with known camera parameters
             print(f"[S3] Multi-view mode with {len(crop_paths)} crops: {view_labels}")
@@ -286,6 +321,8 @@ class InstantMeshGenerator:
 
         with torch.no_grad():
             planes = model.forward_planes(images_tensor, cameras_tensor)
+            del images_tensor, cameras_tensor
+            torch.cuda.empty_cache()
             mesh_result = model.extract_mesh(
                 planes,
                 use_texture_map=True,
