@@ -5,7 +5,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, SmallInteger, Text, TypeDecorator
+from sqlalchemy import DateTime, JSON, SmallInteger, Text, TypeDecorator
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.types import JSON as JSONType
 from sqlalchemy.ext.asyncio import (
@@ -47,8 +47,8 @@ class Job(Base):
     __tablename__ = "jobs"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=lambda: str(uuid.uuid4()))
-    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
-    updated_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     # Input
     input_type: Mapped[str] = mapped_column(Text)        # 'url' | 'image'
