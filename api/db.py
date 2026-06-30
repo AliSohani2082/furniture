@@ -5,7 +5,7 @@ import os
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ARRAY, JSON, SmallInteger, Text
+from sqlalchemy import JSON, SmallInteger, Text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -45,9 +45,9 @@ class Job(Base):
     furniture_category: Mapped[str | None] = mapped_column(Text, nullable=True)
     dimensions_mm: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
-    # S2 crops (parallel arrays)
-    crop_s3_keys: Mapped[list[str] | None] = mapped_column(ARRAY(Text), nullable=True)
-    mask_s3_keys: Mapped[list[str] | None] = mapped_column(ARRAY(Text), nullable=True)
+    # S2 crops (parallel arrays — stored as JSON for SQLite/Postgres portability)
+    crop_s3_keys: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    mask_s3_keys: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
 
     # S3–S5 mesh outputs
     mesh_glb_s3_key: Mapped[str | None] = mapped_column(Text, nullable=True)
