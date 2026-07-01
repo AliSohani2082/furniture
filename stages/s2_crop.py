@@ -318,7 +318,7 @@ class Cropper:
                     "view_label": view_label,
                     "crop_rel": str(crop_path.relative_to(ARTIFACTS_DIR)),
                     "mask_rel": mask_rel,
-                    "fallback": fallback,
+                    "fallback": True,
                 }
             ],
         }
