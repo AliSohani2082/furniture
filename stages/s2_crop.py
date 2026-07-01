@@ -280,9 +280,12 @@ class Cropper:
         labels: list[str] | None = None,
     ) -> CropResult:
         """
-        Run the full S2 pipeline (GroundingDINO → SAM2 → rembg fallback)
-        on raw image bytes instead of a URL. Used by the test_local_image_s2
-        entrypoint to avoid skipping background removal.
+        Remove the background of a raw product image using rembg, then
+        fit it to a 512×512 RGBA canvas. Used by test_local_image_s2 for
+        clean product shots where the whole frame is the furniture piece —
+        rembg outperforms GroundingDINO+SAM2 here because detection tends
+        to latch onto one sub-component (e.g. a chaise section) rather
+        than the full silhouette.
         """
         from io import BytesIO
 
@@ -290,12 +293,11 @@ class Cropper:
         job_dir = ARTIFACTS_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        all_labels = labels or FURNITURE_LABELS
-
         image = Image.open(BytesIO(image_data)).convert("RGB")
-
-        rgba, mask_img, fallback = self._segment_image(image, all_labels)
-        print(f"[S2] crop_from_bytes: fallback={fallback}")
+        rgba = self.rembg.remove(image, session=self.rembg_session)
+        rgba = self._fit_square_rgba(rgba)
+        mask_img = rgba.split()[3]  # alpha channel as grayscale mask
+        print(f"[S2] crop_from_bytes: rembg background removal applied")
 
         crop_path = job_dir / "crop_0.png"
         rgba.save(crop_path)
