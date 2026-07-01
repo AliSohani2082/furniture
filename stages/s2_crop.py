@@ -270,3 +270,53 @@ class Cropper:
 
         ARTIFACTS_VOLUME.commit()
         return {"job_id": job_id, "crops": crops}
+
+    @modal.method()
+    def crop_from_bytes(
+        self,
+        job_id: str,
+        image_data: bytes,
+        view_label: str = "front",
+        labels: list[str] | None = None,
+    ) -> CropResult:
+        """
+        Run the full S2 pipeline (GroundingDINO → SAM2 → rembg fallback)
+        on raw image bytes instead of a URL. Used by the test_local_image_s2
+        entrypoint to avoid skipping background removal.
+        """
+        from io import BytesIO
+
+        ARTIFACTS_VOLUME.reload()
+        job_dir = ARTIFACTS_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        all_labels = labels or FURNITURE_LABELS
+
+        image = Image.open(BytesIO(image_data)).convert("RGB")
+
+        rgba, mask_img, fallback = self._segment_image(image, all_labels)
+        print(f"[S2] crop_from_bytes: fallback={fallback}")
+
+        crop_path = job_dir / "crop_0.png"
+        rgba.save(crop_path)
+
+        mask_rel: str | None = None
+        if mask_img is not None:
+            mask_path = job_dir / "mask_0.png"
+            mask_img.save(mask_path)
+            mask_rel = str(mask_path.relative_to(ARTIFACTS_DIR))
+
+        ARTIFACTS_VOLUME.commit()
+        return {
+            "job_id": job_id,
+            "crops": [
+                {
+                    "index": 0,
+                    "source_url": "local:bytes",
+                    "view_label": view_label,
+                    "crop_rel": str(crop_path.relative_to(ARTIFACTS_DIR)),
+                    "mask_rel": mask_rel,
+                    "fallback": fallback,
+                }
+            ],
+        }
