@@ -270,3 +270,55 @@ class Cropper:
 
         ARTIFACTS_VOLUME.commit()
         return {"job_id": job_id, "crops": crops}
+
+    @modal.method()
+    def crop_from_bytes(
+        self,
+        job_id: str,
+        image_data: bytes,
+        view_label: str = "front",
+        labels: list[str] | None = None,
+    ) -> CropResult:
+        """
+        Remove the background of a raw product image using rembg, then
+        fit it to a 512×512 RGBA canvas. Used by test_local_image_s2 for
+        clean product shots where the whole frame is the furniture piece —
+        rembg outperforms GroundingDINO+SAM2 here because detection tends
+        to latch onto one sub-component (e.g. a chaise section) rather
+        than the full silhouette.
+        """
+        from io import BytesIO
+
+        ARTIFACTS_VOLUME.reload()
+        job_dir = ARTIFACTS_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        image = Image.open(BytesIO(image_data)).convert("RGB")
+        rgba = self.rembg.remove(image, session=self.rembg_session)
+        rgba = self._fit_square_rgba(rgba)
+        mask_img = rgba.split()[3]  # alpha channel as grayscale mask
+        print(f"[S2] crop_from_bytes: rembg background removal applied")
+
+        crop_path = job_dir / "crop_0.png"
+        rgba.save(crop_path)
+
+        mask_rel: str | None = None
+        if mask_img is not None:
+            mask_path = job_dir / "mask_0.png"
+            mask_img.save(mask_path)
+            mask_rel = str(mask_path.relative_to(ARTIFACTS_DIR))
+
+        ARTIFACTS_VOLUME.commit()
+        return {
+            "job_id": job_id,
+            "crops": [
+                {
+                    "index": 0,
+                    "source_url": "local:bytes",
+                    "view_label": view_label,
+                    "crop_rel": str(crop_path.relative_to(ARTIFACTS_DIR)),
+                    "mask_rel": mask_rel,
+                    "fallback": True,
+                }
+            ],
+        }

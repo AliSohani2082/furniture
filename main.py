@@ -318,3 +318,82 @@ def test_local_image(
         json.dumps(manifest, indent=2, default=str), encoding="utf-8"
     )
     print(json.dumps(manifest, indent=2, default=str))
+
+
+@app.local_entrypoint()
+def test_local_image_s2(
+    image_path: str,
+    out_dir: str = "outputs",
+    quality: str = "large",
+):
+    """
+    Like test_local_image but starts from S2 (Cropper) so background removal
+    is actually performed before reconstruction.
+
+    Example:
+        modal run main.py::test_local_image_s2 --image-path grey_sofa.png
+    """
+    job_id = uuid.uuid4().hex[:12]
+    out_root = Path(out_dir) / job_id
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    image_bytes = Path(image_path).read_bytes()
+
+    # S2 — Crop with background removal
+    crop_result = Cropper().crop_from_bytes.remote(job_id, image_bytes, view_label="front")
+    print(f"[S2] cropped {len(crop_result['crops'])} images  fallback={crop_result['crops'][0]['fallback']}")
+
+    intelligence = {
+        "furniture_category": "furniture",
+        "material_hints": [],
+        "dimensions_mm": None,
+        "dimensions_source": "absent",
+        "view_classifications": [
+            {
+                "url": "local:bytes",
+                "view": "front",
+                "confidence": 1.0,
+                "is_product_isolated": False,
+            }
+        ],
+        "reconstruction_candidates": ["local:bytes"],
+        "texture_candidates": ["local:bytes"],
+    }
+
+    # S3 onwards
+    reconstruct = InstantMeshGenerator().generate.remote(
+        job_id, crop_result, intelligence, quality=quality
+    )
+    scale = scale_mesh.remote(job_id, reconstruct, None, "absent")
+    texture = TextureFuser().fuse.remote(job_id, scale, crop_result, intelligence)
+    renders = render_views.remote(job_id, texture)
+
+    zero123_grid_rel = f"{job_id}/zero123_grid.png"
+    all_rels = [
+        *[c["crop_rel"] for c in crop_result["crops"]],
+        *[c["mask_rel"] for c in crop_result["crops"] if c.get("mask_rel")],
+        zero123_grid_rel,
+        reconstruct["glb_rel"], reconstruct["obj_rel"], reconstruct["uv_map_rel"],
+        scale["scaled_glb_rel"], scale["scaled_obj_rel"],
+        texture["textured_glb_rel"], texture["textured_obj_rel"],
+        texture["texture_atlas_rel"],
+        renders["front_rel"], renders["side_rel"],
+        renders["top_rel"], renders["angled_rel"],
+    ]
+    _save_artifacts(job_id, all_rels, out_root)
+
+    manifest = {
+        "job_id": job_id,
+        "pipeline": APP_NAME,
+        "image_path": image_path,
+        "quality": quality,
+        "crop": crop_result,
+        "reconstruct": reconstruct,
+        "scale": scale,
+        "texture": texture,
+        "renders": renders,
+    }
+    (out_root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, default=str), encoding="utf-8"
+    )
+    print(json.dumps(manifest, indent=2, default=str))
