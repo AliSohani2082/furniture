@@ -231,8 +231,7 @@ class InstantMeshGenerator:
         imgs = []
         for p in image_paths:
             img = Image.open(p).convert("RGBA")
-            # Fill alpha with white background (InstantMesh convention)
-            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg = Image.new("RGB", img.size, (127, 127, 127))
             bg.paste(img, mask=img.split()[3])
             t = TF.to_tensor(TF.resize(bg, [320, 320]))  # (3, 320, 320) [0,1]
             imgs.append(t * 2 - 1)  # → [-1, 1]
@@ -361,14 +360,14 @@ class InstantMeshGenerator:
         pipeline = self._get_pipeline(quality)
         config = self._configs[quality]
 
+        # Pass RGBA directly — zero123plus/pipeline.py calls to_rgb_image()
+        # internally which composites onto gray (127,127,127). Manually
+        # pre-compositing onto white would override that and break the model.
         source_img = Image.open(single_crop_path).convert("RGBA")
-        bg = Image.new("RGB", source_img.size, (255, 255, 255))
-        bg.paste(source_img, mask=source_img.split()[3])
-        source_rgb = bg
 
         with torch.no_grad():
             output = pipeline(
-                source_rgb,
+                source_img,
                 num_inference_steps=config.infer_config.get("diff_steps", 75),
                 guidance_scale=config.infer_config.get("guidance_scale", 4.0),
             ).images[0]
