@@ -368,9 +368,11 @@ def test_local_image_s2(
     texture = TextureFuser().fuse.remote(job_id, scale, crop_result, intelligence)
     renders = render_views.remote(job_id, texture)
 
+    zero123_grid_rel = f"{job_id}/zero123_grid.png"
     all_rels = [
         *[c["crop_rel"] for c in crop_result["crops"]],
         *[c["mask_rel"] for c in crop_result["crops"] if c.get("mask_rel")],
+        zero123_grid_rel,
         reconstruct["glb_rel"], reconstruct["obj_rel"], reconstruct["uv_map_rel"],
         scale["scaled_glb_rel"], scale["scaled_obj_rel"],
         texture["textured_glb_rel"], texture["textured_obj_rel"],

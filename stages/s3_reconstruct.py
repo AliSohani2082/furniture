@@ -373,6 +373,11 @@ class InstantMeshGenerator:
                 guidance_scale=config.infer_config.get("guidance_scale", 4.0),
             ).images[0]
 
+        # Save the raw Zero123++ grid so we can inspect the synthesised views
+        grid_path = single_crop_path.parent / "zero123_grid.png"
+        output.save(grid_path)
+        print(f"[S3] Zero123++ grid saved → {grid_path}")
+
         # output is a single image with 6 views tiled in a 2×3 grid (320×320 each)
         view_images = self._split_zero123_grid(output)
 
